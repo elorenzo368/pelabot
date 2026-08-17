@@ -32,6 +32,7 @@
     "@types/node": "^22.5.4",
     "@vitest/coverage-v8": "^2.0.5",
     "eslint": "^9.9.1",
+    "globals": "^14.0.0",
     "prettier": "^3.3.3",
     "tsx": "^4.19.0",
     "typescript": "^5.5.4",

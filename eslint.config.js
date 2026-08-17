@@ -1,5 +1,6 @@
 // @ts-check
 import js from "@eslint/js";
+import globals from "globals";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
@@ -10,9 +11,17 @@ export default tseslint.config(
   ...tseslint.configs.recommendedTypeChecked,
   {
     languageOptions: {
+      globals: globals.node,
       parserOptions: {
         projectService: {
-          allowDefaultProject: ["*.config.js", "*.config.ts", ".prettierrc"],
+          allowDefaultProject: [
+            "*.config.js",
+            "*.config.ts",
+            ".prettierrc",
+            "scripts/*.mjs",
+            "scripts/*.ts",
+            "scripts/lib/*.mjs",
+          ],
         },
         tsconfigRootDir: import.meta.dirname,
       },
@@ -22,6 +31,23 @@ export default tseslint.config(
         "error",
         { varsIgnorePattern: "^_", argsIgnorePattern: "^_" },
       ],
+    },
+  },
+  {
+    // Plain JS ops scripts (download/checksum/spawn helpers): the ephemeral
+    // single-file "default project" TS gives them (allowDefaultProject
+    // above) doesn't carry full Node type info, so type-aware rules see
+    // `any` at nearly every Node core-module call. Same relaxation the
+    // project already applies to `**/*.test.ts` below, extended to these
+    // untyped-by-design files rather than fighting the checker on files
+    // that were never meant to be strictly typed.
+    files: ["scripts/**/*.mjs"],
+    rules: {
+      "@typescript-eslint/no-unsafe-argument": "off",
+      "@typescript-eslint/no-unsafe-assignment": "off",
+      "@typescript-eslint/no-unsafe-call": "off",
+      "@typescript-eslint/no-unsafe-member-access": "off",
+      "@typescript-eslint/no-unsafe-return": "off",
     },
   },
   {
