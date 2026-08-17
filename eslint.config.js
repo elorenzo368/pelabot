@@ -22,6 +22,11 @@ export default tseslint.config(
             "scripts/*.ts",
             "scripts/lib/*.mjs",
           ],
+          // scripts/ is a small, growing set of standalone ops scripts, not
+          // part of the src/ program — each one intentionally runs on its
+          // own ephemeral default project rather than joining a shared
+          // tsconfig. Past 8 files this needs an explicit opt-in.
+          maximumDefaultProjectFileMatchCount_THIS_WILL_SLOW_DOWN_LINTING: 24,
         },
         tsconfigRootDir: import.meta.dirname,
       },
