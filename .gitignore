@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 build/
+*.tsbuildinfo
 
 # Test output
 coverage/
@@ -13,10 +14,23 @@ coverage/
 .env.*
 !.env.example
 
+# Secrets and credentials — never committed (PRD §21)
+*cookie*
+cookies/
+secrets/
+
+# Vendored binaries and downloads — materialized by `npm run setup`,
+# except the two committed pin files (C-13, C-26)
+bin/
+vendor/*
+!vendor/versions.json
+!vendor/bgutil-pot-provider.package-lock.json
+
 # Local tooling state: auto-generated and contains machine-specific absolute paths
 .atl/
 
 # Logs
+logs/
 *.log
 npm-debug.log*
 
