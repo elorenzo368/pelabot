@@ -304,7 +304,23 @@ export class DiscordVoiceGateway implements VoiceGateway {
     const set = this.listeners.get(event) as Set<Listener<E>> | undefined;
     if (set === undefined) return;
     for (const listener of set) {
-      listener(payload);
+      // Per-listener isolation: without it one throwing subscriber aborts
+      // delivery to every other listener AND propagates synchronously back
+      // into the discord.js internals that emitted the underlying event.
+      try {
+        listener(payload);
+      } catch (raw) {
+        logEvent(
+          this.deps.logger,
+          "voice_listener_failed",
+          {
+            voiceEvent: event,
+            guildId: payload.guildId,
+            error: toError(raw).message,
+          },
+          "error",
+        );
+      }
     }
   }
 }

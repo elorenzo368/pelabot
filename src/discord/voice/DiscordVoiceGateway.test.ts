@@ -405,6 +405,38 @@ describe("DiscordVoiceGateway.on", () => {
     ]);
   });
 
+  it("isolates listeners: one that throws neither blocks the rest nor escapes into discord.js", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    const before = vi.fn();
+    const after = vi.fn();
+    gateway.on("ready", before);
+    gateway.on("ready", () => {
+      throw new Error("subscriber blew up");
+    });
+    gateway.on("ready", after);
+
+    // A throw here would propagate synchronously back into the emitting
+    // discord.js internals.
+    expect(() => connection.setReady()).not.toThrow();
+
+    expect(before).toHaveBeenCalledTimes(1);
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "voice_listener_failed",
+        voiceEvent: "ready",
+        guildId: "guild-1",
+        error: "subscriber blew up",
+      }),
+    );
+  });
+
   it("returns an unsubscribe function that stops further delivery", async () => {
     const { deps, connection } = buildDeps();
     const gateway = new DiscordVoiceGateway(deps);
