@@ -48,6 +48,10 @@ export default tseslint.config(
       "@typescript-eslint/no-unsafe-call": "off",
       "@typescript-eslint/no-unsafe-member-access": "off",
       "@typescript-eslint/no-unsafe-return": "off",
+      // Injected-dependency interfaces (fakes in tests, sync wrappers like
+      // `pathExists`) are async by contract even when a given implementation
+      // has nothing to await.
+      "@typescript-eslint/require-await": "off",
     },
   },
   {

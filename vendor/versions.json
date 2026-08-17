@@ -1,0 +1,24 @@
+{
+  "ytdlp": {
+    "version": "PENDING",
+    "distributionShape": "pending",
+    "platforms": {
+      "win32-x64": { "url": "", "sha256": "" },
+      "linux-x64": { "url": "", "sha256": "" }
+    }
+  },
+  "potServer": {
+    "version": "PENDING",
+    "platforms": {
+      "win32-x64": { "url": "", "sha256": "" },
+      "linux-x64": { "url": "", "sha256": "" }
+    }
+  },
+  "potPlugin": {
+    "version": "PENDING",
+    "platforms": {
+      "win32-x64": { "url": "", "sha256": "" },
+      "linux-x64": { "url": "", "sha256": "" }
+    }
+  }
+}
