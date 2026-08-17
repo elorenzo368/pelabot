@@ -52,7 +52,17 @@ export interface VoiceEventMap {
  * reconnect ladder are Phase 2b/7 (design-part6 §5).
  */
 export interface VoiceGateway {
-  /** Rejects at `VOICE_JOIN_TIMEOUT_MS` if the connection never reaches Ready. */
+  /**
+   * Rejects at `VOICE_JOIN_TIMEOUT_MS` if the connection never reaches Ready.
+   *
+   * Idempotent per guild: calling it again for a guild that already has a
+   * live session RETARGETS that session at `channelId` and reuses its
+   * connection, player and event registration — it never stands up a second
+   * one. Exactly one live handler set exists per guild at any time, so a
+   * reconnect always produces exactly one `ready` event with one monotonic
+   * generation. A guild whose tracked connection has since been destroyed or
+   * replaced gets its stale session torn down first, then a fresh one.
+   */
   join(guildId: string, channelId: string): Promise<void>;
   leave(guildId: string): Promise<void>;
   play(

@@ -116,7 +116,31 @@ export class DiscordVoiceGateway implements VoiceGateway {
   constructor(private readonly deps: DiscordVoiceGatewayDeps) {}
 
   async join(guildId: string, channelId: string): Promise<void> {
+    const existing = this.states.get(guildId);
     const connection = this.deps.joinChannel(guildId, channelId);
+
+    // Idempotent re-join. `joinVoiceChannel` hands back the SAME
+    // `VoiceConnection` for a guild that is already tracked and not
+    // destroyed, and leaves it in whatever state it was — a Ready connection
+    // stays Ready and never emits a second Ready. Registering again on that
+    // one emitter would (a) stack a duplicate Ready handler, so every later
+    // reconnect fired N subscribes and N `ready` events carrying stale
+    // generations, and (b) strand a brand-new `AudioPlayer` that nothing
+    // ever subscribes. So reuse the live session and just retarget it.
+    if (existing !== undefined && existing.connection === connection) {
+      existing.channelId = channelId;
+      await this.enterReady(guildId, connection);
+      return;
+    }
+
+    // Different connection: the tracked one is gone (destroyed/replaced), so
+    // its registration is stale. Drop it before building the new session —
+    // never `destroy()` it, that throws on an already-destroyed connection.
+    if (existing !== undefined) {
+      this.disposeSession(guildId, existing);
+      this.states.delete(guildId);
+    }
+
     const player = this.deps.createAudioPlayer();
     const state: GuildVoiceState = {
       connection,
@@ -165,6 +189,14 @@ export class DiscordVoiceGateway implements VoiceGateway {
       player.off("error", onPlayerError);
     };
 
+    await this.enterReady(guildId, connection);
+  }
+
+  /**
+   * Waits out `VOICE_JOIN_TIMEOUT_MS` for Ready, tearing the whole session
+   * down on failure so a half-open join never leaves a tracked state behind.
+   */
+  private async enterReady(guildId: string, connection: VoiceConnection): Promise<void> {
     try {
       await this.deps.entersState(
         connection,
@@ -172,8 +204,7 @@ export class DiscordVoiceGateway implements VoiceGateway {
         this.deps.voiceJoinTimeoutMs,
       );
     } catch (error) {
-      connection.destroy();
-      this.states.delete(guildId);
+      await this.leave(guildId);
       throw error;
     }
   }
@@ -184,18 +215,27 @@ export class DiscordVoiceGateway implements VoiceGateway {
   leave(guildId: string): Promise<void> {
     const state = this.states.get(guildId);
     if (state === undefined) return Promise.resolve();
-    state.detachListeners();
-    // `connection.destroy()` on its own deregisters NOTHING on the player
-    // side: the player stays in @discordjs/voice's global 20ms audio cycle
-    // (its own `checkPlayable()` never notices the connection is gone) and
-    // the upstream extractor process is never told to die. Force-stop the
-    // player, then reuse `stop()`'s stream teardown rather than duplicating
-    // it, and only then drop the connection.
-    state.player.stop(true);
-    this.stop(guildId);
+    this.disposeSession(guildId, state);
     state.connection.destroy();
     this.states.delete(guildId);
     return Promise.resolve();
+  }
+
+  /**
+   * Unwinds everything `join()` attached for a session EXCEPT the connection
+   * itself (a stale session's connection is already destroyed, and
+   * `destroy()` throws when called twice).
+   *
+   * `connection.destroy()` on its own deregisters NOTHING on the player
+   * side: the player stays in @discordjs/voice's global 20ms audio cycle
+   * (its own `checkPlayable()` never notices the connection is gone) and the
+   * upstream extractor process is never told to die.
+   */
+  private disposeSession(guildId: string, state: GuildVoiceState): void {
+    state.detachListeners();
+    state.player.stop(true);
+    // Reuse stop()'s stream teardown rather than duplicating it.
+    this.stop(guildId);
   }
 
   async play(

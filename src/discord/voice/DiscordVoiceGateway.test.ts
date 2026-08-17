@@ -76,6 +76,56 @@ describe("DiscordVoiceGateway.join (C-01, join half)", () => {
     expect(connection.subscribe).toHaveBeenCalledTimes(2);
   });
 
+  it("re-joining a live guild reuses the session instead of stacking a second registration", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const readyEvents: VoiceEventMap["ready"][] = [];
+    gateway.on("ready", (payload) => readyEvents.push(payload));
+
+    const first = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await first;
+
+    // joinVoiceChannel returns the SAME VoiceConnection for a guild that is
+    // already tracked and not destroyed, and leaves it Ready.
+    await gateway.join("guild-1", "channel-2");
+
+    connection.subscribe.mockClear();
+    readyEvents.length = 0;
+    connection.setReady();
+
+    expect(connection.listenerCount(VoiceConnectionStatus.Ready)).toBe(1);
+    expect(connection.subscribe).toHaveBeenCalledTimes(1);
+    expect(readyEvents).toEqual([
+      { guildId: "guild-1", channelId: "channel-2", generation: 1, reconnect: true },
+    ]);
+    // No orphan player: a second one would never be subscribed by anything.
+    expect(deps.createAudioPlayer).toHaveBeenCalledTimes(1);
+  });
+
+  it("replaces a stale session when a different connection comes back", async () => {
+    const { deps, connection, player } = buildDeps();
+    const replacement = new FakeConnection();
+    (deps.joinChannel as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(connection)
+      .mockReturnValueOnce(replacement);
+    const gateway = new DiscordVoiceGateway(deps);
+
+    const first = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await first;
+
+    const second = gateway.join("guild-1", "channel-1");
+    replacement.setReady();
+    await second;
+
+    expect(connection.listenerCount(VoiceConnectionStatus.Ready)).toBe(0);
+    expect(connection.listenerCount("error")).toBe(0);
+    expect(player.stop).toHaveBeenCalledTimes(1);
+    expect(replacement.listenerCount(VoiceConnectionStatus.Ready)).toBe(1);
+    expect(replacement.subscribe).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects at voiceJoinTimeoutMs when Ready never arrives, and destroys the connection", async () => {
     const { deps, connection } = buildDeps({ voiceJoinTimeoutMs: 20 });
     const gateway = new DiscordVoiceGateway(deps);
