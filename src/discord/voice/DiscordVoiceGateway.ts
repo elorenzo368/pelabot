@@ -53,6 +53,12 @@ interface GuildVoiceState {
   channelId: string;
   generation: number;
   resource: AudioResource | undefined;
+  /**
+   * Removes every listener `join()` registered for THIS session. Assigned
+   * right after registration (the handlers close over `state`, so the
+   * object has to exist first) and never called twice for one session.
+   */
+  detachListeners: Unsubscribe;
 }
 
 export interface DiscordVoiceGatewayDeps {
@@ -118,13 +124,14 @@ export class DiscordVoiceGateway implements VoiceGateway {
       channelId,
       generation: -1,
       resource: undefined,
+      detachListeners: () => {},
     };
     this.states.set(guildId, state);
 
     // C-01: subscribe on EVERY Ready, reconnects included — a missing
     // subscribe presents as a permanent AudioPlayerStatus.AutoPaused hang,
     // never as an error anywhere.
-    connection.on(VoiceConnectionStatus.Ready, () => {
+    const onReady = (): void => {
       connection.subscribe(player);
       state.generation += 1;
       this.emit("ready", {
@@ -133,7 +140,7 @@ export class DiscordVoiceGateway implements VoiceGateway {
         generation: state.generation,
         reconnect: state.generation > 0,
       });
-    });
+    };
 
     // Both `VoiceConnection` and `AudioPlayer` are plain EventEmitters, and
     // both emit "error" (onNetworkingError / onStreamError). An "error" with
@@ -142,12 +149,21 @@ export class DiscordVoiceGateway implements VoiceGateway {
     // it. These two listeners are what keeps a single guild's failure a
     // single guild's failure, and they feed the port's declared `error`
     // event so downstream consumers can actually react.
-    connection.on("error", (error) => {
+    const onConnectionError = (error: unknown): void => {
       this.reportError("voice_connection_error", guildId, state, error);
-    });
-    player.on("error", (error) => {
+    };
+    const onPlayerError = (error: unknown): void => {
       this.reportError("voice_player_error", guildId, state, error);
-    });
+    };
+
+    connection.on(VoiceConnectionStatus.Ready, onReady);
+    connection.on("error", onConnectionError);
+    player.on("error", onPlayerError);
+    state.detachListeners = () => {
+      connection.off(VoiceConnectionStatus.Ready, onReady);
+      connection.off("error", onConnectionError);
+      player.off("error", onPlayerError);
+    };
 
     try {
       await this.deps.entersState(
@@ -168,6 +184,15 @@ export class DiscordVoiceGateway implements VoiceGateway {
   leave(guildId: string): Promise<void> {
     const state = this.states.get(guildId);
     if (state === undefined) return Promise.resolve();
+    state.detachListeners();
+    // `connection.destroy()` on its own deregisters NOTHING on the player
+    // side: the player stays in @discordjs/voice's global 20ms audio cycle
+    // (its own `checkPlayable()` never notices the connection is gone) and
+    // the upstream extractor process is never told to die. Force-stop the
+    // player, then reuse `stop()`'s stream teardown rather than duplicating
+    // it, and only then drop the connection.
+    state.player.stop(true);
+    this.stop(guildId);
     state.connection.destroy();
     this.states.delete(guildId);
     return Promise.resolve();

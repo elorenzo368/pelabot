@@ -21,6 +21,7 @@ class FakePlayer extends EventEmitter {
   play = vi.fn();
   pause = vi.fn();
   unpause = vi.fn();
+  stop = vi.fn();
 
   setPlaying(): void {
     this.state = { status: AudioPlayerStatus.Playing };
@@ -102,6 +103,51 @@ describe("DiscordVoiceGateway.leave", () => {
     const gateway = new DiscordVoiceGateway(deps);
 
     await expect(gateway.leave("never-joined")).resolves.toBeUndefined();
+  });
+
+  it("stops the player and destroys the resource stream when leaving mid-playback", async () => {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const destroyStream = vi.fn();
+    (deps.createAudioResource as ReturnType<typeof vi.fn>).mockReturnValue({
+      playStream: { destroy: destroyStream },
+    });
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    const playPromise = gateway.play("guild-1", fakeAudioSource(), 0, {
+      signal: new AbortController().signal,
+    });
+    player.setPlaying();
+    await playPromise;
+
+    await gateway.leave("guild-1");
+
+    // connection.destroy() alone leaves the player registered in
+    // @discordjs/voice's global 20ms audio cycle and never signals the
+    // upstream extractor process to die.
+    expect(player.stop).toHaveBeenCalledTimes(1);
+    expect(destroyStream).toHaveBeenCalledTimes(1);
+    expect(connection.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("detaches every listener it registered, so a post-leave Ready cannot resubscribe", async () => {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    await gateway.leave("guild-1");
+
+    expect(connection.listenerCount(VoiceConnectionStatus.Ready)).toBe(0);
+    expect(connection.listenerCount("error")).toBe(0);
+    expect(player.listenerCount("error")).toBe(0);
+
+    connection.setReady();
+    expect(connection.subscribe).toHaveBeenCalledTimes(1);
   });
 });
 
