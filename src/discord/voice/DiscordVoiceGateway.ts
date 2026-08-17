@@ -17,7 +17,7 @@ import type {
   VoiceEventMap,
   VoiceGateway,
 } from "../../music/VoiceGateway.js";
-import type { Logger } from "../../utils/logger.js";
+import { logEvent, type Logger } from "../../utils/logger.js";
 
 /**
  * Produces a live `VoiceConnection` for `(guildId, channelId)`. Kept out of
@@ -85,6 +85,15 @@ export function createDiscordVoiceGatewayDeps(
 type Listener<E extends keyof VoiceEventMap> = (payload: VoiceEventMap[E]) => void;
 
 /**
+ * `EventEmitter#emit("error", …)` can carry ANY value, so the port's
+ * `error` payload — which promises a real `Error` — has to normalize
+ * whatever @discordjs/voice hands us.
+ */
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+/**
  * `VoiceGateway` port implementation (ADR-007), a thin @discordjs/voice
  * wrapper. `play()` here is the Phase 1 stub: steps 2-4 of design-part6 §5
  * (`demuxProbe` -> `createAudioResource` -> `player.play` -> `entersState`,
@@ -124,6 +133,20 @@ export class DiscordVoiceGateway implements VoiceGateway {
         generation: state.generation,
         reconnect: state.generation > 0,
       });
+    });
+
+    // Both `VoiceConnection` and `AudioPlayer` are plain EventEmitters, and
+    // both emit "error" (onNetworkingError / onStreamError). An "error" with
+    // ZERO listeners is re-thrown by EventEmitter itself and takes the whole
+    // process down — every other guild's session and the health server with
+    // it. These two listeners are what keeps a single guild's failure a
+    // single guild's failure, and they feed the port's declared `error`
+    // event so downstream consumers can actually react.
+    connection.on("error", (error) => {
+      this.reportError("voice_connection_error", guildId, state, error);
+    });
+    player.on("error", (error) => {
+      this.reportError("voice_player_error", guildId, state, error);
     });
 
     try {
@@ -193,6 +216,23 @@ export class DiscordVoiceGateway implements VoiceGateway {
     return () => {
       set.delete(handler);
     };
+  }
+
+  /** Logs a voice-layer failure under `event` and republishes it on the port. */
+  private reportError(
+    event: "voice_connection_error" | "voice_player_error",
+    guildId: string,
+    state: GuildVoiceState,
+    raw: unknown,
+  ): void {
+    const error = toError(raw);
+    logEvent(
+      this.deps.logger,
+      event,
+      { guildId, generation: state.generation, error: error.message },
+      "error",
+    );
+    this.emit("error", { guildId, generation: state.generation, error });
   }
 
   private emit<E extends keyof VoiceEventMap>(event: E, payload: VoiceEventMap[E]): void {

@@ -2,7 +2,7 @@ import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import { AudioPlayerStatus, VoiceConnectionStatus, entersState } from "@discordjs/voice";
 import { describe, expect, it, vi } from "vitest";
-import type { AudioSource } from "../../music/VoiceGateway.js";
+import type { AudioSource, VoiceEventMap } from "../../music/VoiceGateway.js";
 import { DiscordVoiceGateway, type DiscordVoiceGatewayDeps } from "./DiscordVoiceGateway.js";
 
 class FakeConnection extends EventEmitter {
@@ -207,6 +207,59 @@ describe("DiscordVoiceGateway.pause/resume/stop", () => {
     expect(() => gateway.pause("never-joined")).not.toThrow();
     expect(() => gateway.resume("never-joined")).not.toThrow();
     expect(() => gateway.stop("never-joined")).not.toThrow();
+  });
+});
+
+describe("DiscordVoiceGateway error events", () => {
+  async function joinedGateway() {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const errors: VoiceEventMap["error"][] = [];
+    gateway.on("error", (payload) => errors.push(payload));
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    return { gateway, deps, connection, player, errors };
+  }
+
+  it("does not throw, logs, and re-emits when the connection emits 'error'", async () => {
+    const { deps, connection, errors } = await joinedGateway();
+    const failure = new Error("networking blew up");
+
+    expect(() => connection.emit("error", failure)).not.toThrow();
+
+    expect(errors).toEqual([{ guildId: "guild-1", generation: 0, error: failure }]);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "voice_connection_error",
+        guildId: "guild-1",
+        generation: 0,
+      }),
+    );
+  });
+
+  it("does not throw, logs, and re-emits when the player emits 'error'", async () => {
+    const { deps, player, errors } = await joinedGateway();
+    const failure = new Error("stream blew up");
+
+    expect(() => player.emit("error", failure)).not.toThrow();
+
+    expect(errors).toEqual([{ guildId: "guild-1", generation: 0, error: failure }]);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "voice_player_error", guildId: "guild-1", generation: 0 }),
+    );
+  });
+
+  it("normalizes a non-Error 'error' payload into an Error", async () => {
+    const { connection, errors } = await joinedGateway();
+
+    expect(() => connection.emit("error", "just a string")).not.toThrow();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.error).toBeInstanceOf(Error);
+    expect(errors[0]?.error.message).toContain("just a string");
   });
 });
 
