@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Test output
+coverage/
+
+# Environment — only .env.example is tracked
+.env
+.env.*
+!.env.example
+
+# Local tooling state: auto-generated and contains machine-specific absolute paths
+.atl/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db

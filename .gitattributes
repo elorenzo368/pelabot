@@ -1,0 +1,11 @@
+# Normalize line endings: developed on Windows, deployed to a Linux host.
+# Without this, CRLF leaks into files that must run on Linux (shell scripts
+# fail with "bad interpreter").
+* text=auto eol=lf
+
+# Binary files: never normalize.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
