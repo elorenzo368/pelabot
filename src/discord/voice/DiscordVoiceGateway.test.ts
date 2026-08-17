@@ -1,9 +1,23 @@
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
-import { AudioPlayerStatus, VoiceConnectionStatus, entersState } from "@discordjs/voice";
+import {
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  createAudioPlayer,
+  createAudioResource,
+  demuxProbe,
+  entersState,
+} from "@discordjs/voice";
+import type { Client } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
 import type { AudioSource, VoiceEventMap } from "../../music/VoiceGateway.js";
-import { DiscordVoiceGateway, type DiscordVoiceGatewayDeps } from "./DiscordVoiceGateway.js";
+import type { Logger } from "../../utils/logger.js";
+import {
+  DiscordVoiceGateway,
+  createDiscordVoiceGatewayDeps,
+  createJoinChannelFn,
+  type DiscordVoiceGatewayDeps,
+} from "./DiscordVoiceGateway.js";
 
 class FakeConnection extends EventEmitter {
   state: { status: VoiceConnectionStatus } = { status: VoiceConnectionStatus.Signalling };
@@ -450,5 +464,49 @@ describe("DiscordVoiceGateway.on", () => {
     connection.setReady();
 
     expect(handler).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("production wiring factories", () => {
+  function fakeClient(guilds: Map<string, unknown>): Client {
+    return { guilds: { cache: guilds } } as unknown as Client;
+  }
+
+  it("createJoinChannelFn throws for a guild the client has not cached", () => {
+    const joinChannel = createJoinChannelFn(fakeClient(new Map()));
+
+    expect(() => joinChannel("guild-1", "channel-1")).toThrow(/guild not cached: guild-1/);
+  });
+
+  it("createJoinChannelFn joins through the guild's own adapter, self-deafened", () => {
+    const sendPayload = vi.fn().mockReturnValue(true);
+    const voiceAdapterCreator = vi.fn().mockReturnValue({ sendPayload, destroy: vi.fn() });
+    const client = fakeClient(new Map([["guild-1", { voiceAdapterCreator }]]));
+
+    const connection = createJoinChannelFn(client)("guild-1", "channel-1");
+    try {
+      expect(voiceAdapterCreator).toHaveBeenCalledTimes(1);
+      expect(connection.joinConfig).toMatchObject({
+        guildId: "guild-1",
+        channelId: "channel-1",
+        selfDeaf: true,
+      });
+      expect(sendPayload).toHaveBeenCalledTimes(1);
+    } finally {
+      connection.destroy(false);
+    }
+  });
+
+  it("createDiscordVoiceGatewayDeps wires the real @discordjs/voice primitives", () => {
+    const logger = { error: vi.fn() } as unknown as Logger;
+    const deps = createDiscordVoiceGatewayDeps(fakeClient(new Map()), 1234, logger);
+
+    expect(deps.voiceJoinTimeoutMs).toBe(1234);
+    expect(deps.logger).toBe(logger);
+    expect(deps.createAudioPlayer).toBe(createAudioPlayer);
+    expect(deps.demuxProbe).toBe(demuxProbe);
+    expect(deps.createAudioResource).toBe(createAudioResource);
+    expect(deps.entersState).toBe(entersState);
+    expect(() => deps.joinChannel("guild-1", "channel-1")).toThrow(/guild not cached/);
   });
 });
