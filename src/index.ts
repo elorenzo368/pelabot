@@ -1,4 +1,5 @@
 import { ConfigError, parseEnv, type Config } from "./config/env.js";
+import { startHealthServer } from "./runtime/healthServer.js";
 import { createLogger } from "./utils/logger.js";
 
 /**
@@ -23,12 +24,12 @@ function main(): void {
   const logger = createLogger(config);
   logger.info("pela-discord-bot booting");
 
-  // Health server wiring lands in Phase 0.5 (task 0.5.3), and the Discord
-  // client in Phase 1. Until then this composition root has nothing left
-  // to keep the process alive for, so it exits cleanly rather than hanging.
-  logger.info("health server placeholder — not wired yet, exiting cleanly");
-
-  process.exit(0);
+  // The Discord client lands in Phase 1. Until then the health server is
+  // this process's only reason to keep running — its own listen() call
+  // keeps the event loop alive, so main() no longer exits after boot.
+  // /health always reports discord: "disconnected" / 503 here (D-14),
+  // which is correct: Discord is never connected at this phase.
+  startHealthServer(config, logger);
 }
 
 main();
