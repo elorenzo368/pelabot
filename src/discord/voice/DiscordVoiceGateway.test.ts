@@ -1,0 +1,512 @@
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
+import {
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  createAudioPlayer,
+  createAudioResource,
+  demuxProbe,
+  entersState,
+} from "@discordjs/voice";
+import type { Client } from "discord.js";
+import { describe, expect, it, vi } from "vitest";
+import type { AudioSource, VoiceEventMap } from "../../music/VoiceGateway.js";
+import type { Logger } from "../../utils/logger.js";
+import {
+  DiscordVoiceGateway,
+  createDiscordVoiceGatewayDeps,
+  createJoinChannelFn,
+  type DiscordVoiceGatewayDeps,
+} from "./DiscordVoiceGateway.js";
+
+class FakeConnection extends EventEmitter {
+  state: { status: VoiceConnectionStatus } = { status: VoiceConnectionStatus.Signalling };
+  subscribe = vi.fn();
+  destroy = vi.fn();
+
+  setReady(): void {
+    this.state = { status: VoiceConnectionStatus.Ready };
+    this.emit(VoiceConnectionStatus.Ready);
+  }
+}
+
+class FakePlayer extends EventEmitter {
+  state: { status: AudioPlayerStatus } = { status: AudioPlayerStatus.Idle };
+  play = vi.fn();
+  pause = vi.fn();
+  unpause = vi.fn();
+  stop = vi.fn();
+
+  setPlaying(): void {
+    this.state = { status: AudioPlayerStatus.Playing };
+    this.emit(AudioPlayerStatus.Playing);
+  }
+}
+
+function fakeAudioSource(): AudioSource {
+  return {
+    stream: Readable.from([]),
+    hint: "opus",
+    metadata: { provider: "test", extractedAt: new Date() },
+    dispose: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+function buildDeps(overrides: Partial<DiscordVoiceGatewayDeps> = {}): {
+  deps: DiscordVoiceGatewayDeps;
+  connection: FakeConnection;
+  player: FakePlayer;
+} {
+  const connection = new FakeConnection();
+  const player = new FakePlayer();
+
+  const deps: DiscordVoiceGatewayDeps = {
+    joinChannel: vi.fn().mockReturnValue(connection),
+    createAudioPlayer: vi.fn().mockReturnValue(player),
+    demuxProbe: vi.fn().mockResolvedValue({ stream: Readable.from([]), type: "opus" }),
+    createAudioResource: vi.fn().mockReturnValue({ playStream: { destroy: vi.fn() } }),
+    entersState,
+    voiceJoinTimeoutMs: 1000,
+    logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn() } as never,
+    ...overrides,
+  };
+
+  return { deps, connection, player };
+}
+
+describe("DiscordVoiceGateway.join (C-01, join half)", () => {
+  it("calls connection.subscribe(player) once per Ready, repeated across reconnects", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    expect(connection.subscribe).toHaveBeenCalledTimes(1);
+
+    // Simulate a reconnect: the connection re-enters Ready a second time.
+    connection.setReady();
+    expect(connection.subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-joining a live guild reuses the session instead of stacking a second registration", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const readyEvents: VoiceEventMap["ready"][] = [];
+    gateway.on("ready", (payload) => readyEvents.push(payload));
+
+    const first = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await first;
+
+    // joinVoiceChannel returns the SAME VoiceConnection for a guild that is
+    // already tracked and not destroyed, and leaves it Ready.
+    await gateway.join("guild-1", "channel-2");
+
+    connection.subscribe.mockClear();
+    readyEvents.length = 0;
+    connection.setReady();
+
+    expect(connection.listenerCount(VoiceConnectionStatus.Ready)).toBe(1);
+    expect(connection.subscribe).toHaveBeenCalledTimes(1);
+    expect(readyEvents).toEqual([
+      { guildId: "guild-1", channelId: "channel-2", generation: 1, reconnect: true },
+    ]);
+    // No orphan player: a second one would never be subscribed by anything.
+    expect(deps.createAudioPlayer).toHaveBeenCalledTimes(1);
+  });
+
+  it("replaces a stale session when a different connection comes back", async () => {
+    const { deps, connection, player } = buildDeps();
+    const replacement = new FakeConnection();
+    (deps.joinChannel as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(connection)
+      .mockReturnValueOnce(replacement);
+    const gateway = new DiscordVoiceGateway(deps);
+
+    const first = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await first;
+
+    const second = gateway.join("guild-1", "channel-1");
+    replacement.setReady();
+    await second;
+
+    expect(connection.listenerCount(VoiceConnectionStatus.Ready)).toBe(0);
+    expect(connection.listenerCount("error")).toBe(0);
+    expect(player.stop).toHaveBeenCalledTimes(1);
+    expect(replacement.listenerCount(VoiceConnectionStatus.Ready)).toBe(1);
+    expect(replacement.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects with the join deadline's AbortError exactly at voiceJoinTimeoutMs, and tears the session down", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, connection, player } = buildDeps({ voiceJoinTimeoutMs: 20 });
+      const gateway = new DiscordVoiceGateway(deps);
+
+      // The connection never leaves Signalling.
+      const joinPromise = gateway.join("guild-1", "channel-1");
+      let settled = false;
+      const outcome = joinPromise.catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+
+      await vi.advanceTimersByTimeAsync(19);
+      expect(settled).toBe(false);
+      expect(connection.destroy).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+
+      // entersState's own deadline aborts the wait — anything else rejecting
+      // here would mean the documented VOICE_JOIN_TIMEOUT_MS contract never
+      // actually ran.
+      const error = await outcome;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe("AbortError");
+      expect((error as NodeJS.ErrnoException).code).toBe("ABORT_ERR");
+
+      expect(connection.destroy).toHaveBeenCalledTimes(1);
+      expect(player.stop).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("DiscordVoiceGateway.leave", () => {
+  it("destroys the connection for a joined guild", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    await gateway.leave("guild-1");
+
+    expect(connection.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("is a no-op for a guild with no active session", async () => {
+    const { deps } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+
+    await expect(gateway.leave("never-joined")).resolves.toBeUndefined();
+  });
+
+  it("stops the player and destroys the resource stream when leaving mid-playback", async () => {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const destroyStream = vi.fn();
+    (deps.createAudioResource as ReturnType<typeof vi.fn>).mockReturnValue({
+      playStream: { destroy: destroyStream },
+    });
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    const playPromise = gateway.play("guild-1", fakeAudioSource(), 0, {
+      signal: new AbortController().signal,
+    });
+    player.setPlaying();
+    await playPromise;
+
+    await gateway.leave("guild-1");
+
+    // connection.destroy() alone leaves the player registered in
+    // @discordjs/voice's global 20ms audio cycle and never signals the
+    // upstream extractor process to die.
+    expect(player.stop).toHaveBeenCalledTimes(1);
+    expect(destroyStream).toHaveBeenCalledTimes(1);
+    expect(connection.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("detaches every listener it registered, so a post-leave Ready cannot resubscribe", async () => {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    await gateway.leave("guild-1");
+
+    expect(connection.listenerCount(VoiceConnectionStatus.Ready)).toBe(0);
+    expect(connection.listenerCount("error")).toBe(0);
+    expect(player.listenerCount("error")).toBe(0);
+
+    connection.setReady();
+    expect(connection.subscribe).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("DiscordVoiceGateway.play (Phase 1 stub)", () => {
+  async function joinedGateway() {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+    return { gateway, deps, connection, player };
+  }
+
+  it("probes the source, creates a resource, and plays it", async () => {
+    const { gateway, deps, player } = await joinedGateway();
+    const source = fakeAudioSource();
+    const controller = new AbortController();
+
+    const playPromise = gateway.play("guild-1", source, 0, { signal: controller.signal });
+    player.setPlaying();
+    await playPromise;
+
+    expect(deps.demuxProbe).toHaveBeenCalledWith(source.stream);
+    expect(deps.createAudioResource).toHaveBeenCalledTimes(1);
+    expect(player.play).toHaveBeenCalledTimes(1);
+  });
+
+  it("pauses immediately after Playing when opts.startPaused is true", async () => {
+    const { gateway, player } = await joinedGateway();
+    const source = fakeAudioSource();
+    const controller = new AbortController();
+
+    const playPromise = gateway.play("guild-1", source, 0, {
+      signal: controller.signal,
+      startPaused: true,
+    });
+    player.setPlaying();
+    await playPromise;
+
+    expect(player.pause).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws when no session exists for the guild", async () => {
+    const { deps } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const controller = new AbortController();
+
+    await expect(
+      gateway.play("never-joined", fakeAudioSource(), 0, { signal: controller.signal }),
+    ).rejects.toThrow(/no active connection/i);
+  });
+});
+
+describe("DiscordVoiceGateway.pause/resume/stop", () => {
+  it("pause() calls player.pause()", async () => {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    gateway.pause("guild-1");
+    expect(player.pause).toHaveBeenCalledTimes(1);
+  });
+
+  it("resume() calls player.unpause() exactly once (C-02)", async () => {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    gateway.resume("guild-1");
+    expect(player.unpause).toHaveBeenCalledTimes(1);
+  });
+
+  it("stop() destroys the current AudioResource's playStream", async () => {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    const destroyStream = vi.fn();
+    (deps.createAudioResource as ReturnType<typeof vi.fn>).mockReturnValue({
+      playStream: { destroy: destroyStream },
+    });
+
+    const source = fakeAudioSource();
+    const controller = new AbortController();
+    const playPromise = gateway.play("guild-1", source, 0, { signal: controller.signal });
+    player.setPlaying();
+    await playPromise;
+
+    gateway.stop("guild-1");
+    expect(destroyStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("pause/resume/stop are no-ops for a guild with no active session", () => {
+    const { deps } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+
+    expect(() => gateway.pause("never-joined")).not.toThrow();
+    expect(() => gateway.resume("never-joined")).not.toThrow();
+    expect(() => gateway.stop("never-joined")).not.toThrow();
+  });
+});
+
+describe("DiscordVoiceGateway error events", () => {
+  async function joinedGateway() {
+    const { deps, connection, player } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const errors: VoiceEventMap["error"][] = [];
+    gateway.on("error", (payload) => errors.push(payload));
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    return { gateway, deps, connection, player, errors };
+  }
+
+  it("does not throw, logs, and re-emits when the connection emits 'error'", async () => {
+    const { deps, connection, errors } = await joinedGateway();
+    const failure = new Error("networking blew up");
+
+    expect(() => connection.emit("error", failure)).not.toThrow();
+
+    expect(errors).toEqual([{ guildId: "guild-1", generation: 0, error: failure }]);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "voice_connection_error",
+        guildId: "guild-1",
+        generation: 0,
+      }),
+    );
+  });
+
+  it("does not throw, logs, and re-emits when the player emits 'error'", async () => {
+    const { deps, player, errors } = await joinedGateway();
+    const failure = new Error("stream blew up");
+
+    expect(() => player.emit("error", failure)).not.toThrow();
+
+    expect(errors).toEqual([{ guildId: "guild-1", generation: 0, error: failure }]);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ event: "voice_player_error", guildId: "guild-1", generation: 0 }),
+    );
+  });
+
+  it("normalizes a non-Error 'error' payload into an Error", async () => {
+    const { connection, errors } = await joinedGateway();
+
+    expect(() => connection.emit("error", "just a string")).not.toThrow();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.error).toBeInstanceOf(Error);
+    expect(errors[0]?.error.message).toContain("just a string");
+  });
+});
+
+describe("DiscordVoiceGateway.on", () => {
+  it("emits 'ready' with an incrementing generation on every Ready, including reconnects", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const readyEvents: unknown[] = [];
+    gateway.on("ready", (payload) => readyEvents.push(payload));
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+    connection.setReady();
+
+    expect(readyEvents).toEqual([
+      { guildId: "guild-1", channelId: "channel-1", generation: 0, reconnect: false },
+      { guildId: "guild-1", channelId: "channel-1", generation: 1, reconnect: true },
+    ]);
+  });
+
+  it("isolates listeners: one that throws neither blocks the rest nor escapes into discord.js", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+
+    const before = vi.fn();
+    const after = vi.fn();
+    gateway.on("ready", before);
+    gateway.on("ready", () => {
+      throw new Error("subscriber blew up");
+    });
+    gateway.on("ready", after);
+
+    // A throw here would propagate synchronously back into the emitting
+    // discord.js internals.
+    expect(() => connection.setReady()).not.toThrow();
+
+    expect(before).toHaveBeenCalledTimes(1);
+    expect(after).toHaveBeenCalledTimes(1);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "voice_listener_failed",
+        voiceEvent: "ready",
+        guildId: "guild-1",
+        error: "subscriber blew up",
+      }),
+    );
+  });
+
+  it("returns an unsubscribe function that stops further delivery", async () => {
+    const { deps, connection } = buildDeps();
+    const gateway = new DiscordVoiceGateway(deps);
+    const handler = vi.fn();
+    const unsubscribe = gateway.on("ready", handler);
+
+    const joinPromise = gateway.join("guild-1", "channel-1");
+    connection.setReady();
+    await joinPromise;
+    unsubscribe();
+    connection.setReady();
+
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("production wiring factories", () => {
+  function fakeClient(guilds: Map<string, unknown>): Client {
+    return { guilds: { cache: guilds } } as unknown as Client;
+  }
+
+  it("createJoinChannelFn throws for a guild the client has not cached", () => {
+    const joinChannel = createJoinChannelFn(fakeClient(new Map()));
+
+    expect(() => joinChannel("guild-1", "channel-1")).toThrow(/guild not cached: guild-1/);
+  });
+
+  it("createJoinChannelFn joins through the guild's own adapter, self-deafened", () => {
+    const sendPayload = vi.fn().mockReturnValue(true);
+    const voiceAdapterCreator = vi.fn().mockReturnValue({ sendPayload, destroy: vi.fn() });
+    const client = fakeClient(new Map([["guild-1", { voiceAdapterCreator }]]));
+
+    const connection = createJoinChannelFn(client)("guild-1", "channel-1");
+    try {
+      expect(voiceAdapterCreator).toHaveBeenCalledTimes(1);
+      expect(connection.joinConfig).toMatchObject({
+        guildId: "guild-1",
+        channelId: "channel-1",
+        selfDeaf: true,
+      });
+      expect(sendPayload).toHaveBeenCalledTimes(1);
+    } finally {
+      connection.destroy(false);
+    }
+  });
+
+  it("createDiscordVoiceGatewayDeps wires the real @discordjs/voice primitives", () => {
+    const logger = { error: vi.fn() } as unknown as Logger;
+    const deps = createDiscordVoiceGatewayDeps(fakeClient(new Map()), 1234, logger);
+
+    expect(deps.voiceJoinTimeoutMs).toBe(1234);
+    expect(deps.logger).toBe(logger);
+    expect(deps.createAudioPlayer).toBe(createAudioPlayer);
+    expect(deps.demuxProbe).toBe(demuxProbe);
+    expect(deps.createAudioResource).toBe(createAudioResource);
+    expect(deps.entersState).toBe(entersState);
+    expect(() => deps.joinChannel("guild-1", "channel-1")).toThrow(/guild not cached/);
+  });
+});

@@ -12,7 +12,7 @@ export default defineConfig({
     exclude: ["tests/live/**", "node_modules/**", "dist/**"],
     coverage: {
       provider: "v8",
-      include: ["src/music/**"],
+      include: ["src/music/**", "src/discord/**"],
       thresholds: {
         lines: 80,
         statements: 80,
