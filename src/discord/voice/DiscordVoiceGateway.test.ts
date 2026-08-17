@@ -126,12 +126,40 @@ describe("DiscordVoiceGateway.join (C-01, join half)", () => {
     expect(replacement.subscribe).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects at voiceJoinTimeoutMs when Ready never arrives, and destroys the connection", async () => {
-    const { deps, connection } = buildDeps({ voiceJoinTimeoutMs: 20 });
-    const gateway = new DiscordVoiceGateway(deps);
+  it("rejects with the join deadline's AbortError exactly at voiceJoinTimeoutMs, and tears the session down", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, connection, player } = buildDeps({ voiceJoinTimeoutMs: 20 });
+      const gateway = new DiscordVoiceGateway(deps);
 
-    await expect(gateway.join("guild-1", "channel-1")).rejects.toBeTruthy();
-    expect(connection.destroy).toHaveBeenCalledTimes(1);
+      // The connection never leaves Signalling.
+      const joinPromise = gateway.join("guild-1", "channel-1");
+      let settled = false;
+      const outcome = joinPromise.catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+
+      await vi.advanceTimersByTimeAsync(19);
+      expect(settled).toBe(false);
+      expect(connection.destroy).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+
+      // entersState's own deadline aborts the wait — anything else rejecting
+      // here would mean the documented VOICE_JOIN_TIMEOUT_MS contract never
+      // actually ran.
+      const error = await outcome;
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe("AbortError");
+      expect((error as NodeJS.ErrnoException).code).toBe("ABORT_ERR");
+
+      expect(connection.destroy).toHaveBeenCalledTimes(1);
+      expect(player.stop).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
